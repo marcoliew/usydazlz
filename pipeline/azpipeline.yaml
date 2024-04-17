@@ -1,0 +1,229 @@
+name: aztest-build-pipeline
+
+trigger:
+ - master
+
+pr: none
+
+variables:
+  - group: aztest
+  
+pool:
+  name: usydcloudopsada
+
+stages:
+
+- stage: setup
+  jobs:
+    - job: package_install
+      steps:
+      - checkout: self
+      - task: Bash@3
+        displayName: 'Check For azure cli'
+        inputs:
+          targetType: 'inline'
+          script: |
+            #!/bin/bash
+            az -h > /dev/null
+            status=$?
+            if [ $status -eq 0 ]; then
+              echo "##########azure cli is installed - checking for version##########"
+              version=$(az -v)
+              echo "##########$version is installed on this agent##########"
+            else
+              echo "##########azcli not installed - installing azcli##########"
+              echo $(sudopassword) | sudo -S rpm --import https://packages.microsoft.com/keys/microsoft.asc
+              echo $(sudopassword) | sudo -S echo -e "[azure-cli]\nname=Azure CLI\nbaseurl=https://packages.microsoft.com/yumrepos/azure-cli\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc" | sudo tee /etc/yum.repos.d/azure-cli.repo
+              echo $(sudopassword) | sudo -S yum install azure-cli -y
+              echo $(sudopassword) | sudo -S az extension add --name azure-devops
+              echo "##########azcli is installed  - checking for version##########"
+              version=$(az -v)
+              echo "##########$version is installed on this agent##########"
+            fi
+          workingDirectory: $(System.DefaultWorkingDirectory)
+          failOnStderr: true
+      - task: Bash@3
+        displayName: 'Check For terraform'
+        inputs:
+          targetType: 'inline'
+          script: |
+            #!/bin/bash
+            terraform -h > /dev/null
+            status=$?
+            if [ $status -eq 0 ]; then
+              echo "##########terraform is installed - checking for version##########"
+              version=$(terraform -v)
+              echo "##########$version is installed on this agent##########"
+            else
+              echo "##########terraform not installed - installing terraform##########"
+              echo $(sudopassword) | sudo -S yum install -y yum-utils
+              echo $(sudopassword) | sudo -S sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+              echo $(sudopassword) | sudo -S sudo yum -y install terraform
+              echo "##########terraform is installed  - checking for version##########"
+              version=$(terraform -v)
+              echo "##########$version is installed on this agent##########"
+            fi
+          workingDirectory: $(System.DefaultWorkingDirectory)
+          failOnStderr: true
+
+- stage: staging
+  variables:
+    - group: aztest-staging-backend
+  condition: succeeded('setup')
+  jobs:
+    - job: terraform_build
+      steps:
+      - checkout: self
+      - task: Bash@3
+        displayName: 'terraform init'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform is initiating##########"
+            terraform init -backend-config=storage_account_name=$(terraformbackendstorageaccount) -backend-config=container_name=$(terraformbackendstoragecontainer) -backend-config=key=$(terraformbackendstatefilename) -backend-config=resource_group_name=$(terraformbackendresourcegroup)
+            echo "##########terraform initiated##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: Bash@3
+        displayName: 'terraform validate'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform is validating##########"
+            terraform validate
+            echo "##########terraform validated##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: Bash@3
+        displayName: 'terraform plan'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform plan started##########"
+            terraform plan -input=false -var-file=environments/$(env).tfvars -out=plan.tfplan
+            echo "##########terraform plan completed##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: ArchiveFiles@2
+        displayName: 'create terraform plan artifacts'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)'
+          includeRootFolder: false
+          archiveType: 'tar'
+          tarCompression: 'gz'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId)-$(env).tgz'
+          replaceExistingArchive: true
+      - task: PublishBuildArtifacts@1
+        displayName: 'publish terraform plan artifacts'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: '$(Build.BuildId)-$(env)-tfplan'
+          publishLocation: 'Container'   
+      - task: DeleteFiles@1
+        displayName: 'remove unneeded files'
+        inputs:
+          contents: |
+            .terraform
+            .tfplan
+            .git
+
+- stage: prod
+  variables:
+    - group: aztest-prod-backend
+  dependsOn:
+  - staging
+  condition: succeeded('staging')
+  jobs:
+    - job: terraform_build
+      steps:
+      - checkout: self
+      - task: Bash@3
+        displayName: 'terraform init'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform is initiating##########"
+            terraform init -backend-config=storage_account_name=$(terraformbackendstorageaccount) -backend-config=container_name=$(terraformbackendstoragecontainer) -backend-config=key=$(terraformbackendstatefilename) -backend-config=resource_group_name=$(terraformbackendresourcegroup)
+            echo "##########terraform initiated##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: Bash@3
+        displayName: 'terraform validate'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform is validating##########"
+            terraform validate
+            echo "##########terraform validated##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: Bash@3
+        displayName: 'terraform plan'
+        env:
+          ARM_CLIENT_ID: $(client_id)
+          ARM_CLIENT_SECRET: $(client_secret)
+          ARM_SUBSCRIPTION_ID: $(subscription_id)
+          ARM_TENANT_ID: $(tenant_id)
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -euo pipefail
+            echo "##########terraform plan started##########"
+            terraform plan -input=false -var-file=environments/$(env).tfvars -out=plan.tfplan
+            echo "##########terraform plan completed##########"
+          workingDirectory: $(System.DefaultWorkingDirectory)/terraform
+          failOnStderr: true
+      - task: ArchiveFiles@2
+        displayName: 'create terraform plan artifacts'
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)'
+          includeRootFolder: false
+          archiveType: 'tar'
+          tarCompression: 'gz'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId)-$(env).tgz'
+          replaceExistingArchive: true
+      - task: PublishBuildArtifacts@1
+        displayName: 'publish terraform plan artifacts'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: '$(Build.BuildId)-$(env)-tfplan'
+          publishLocation: 'Container'   
+      - task: DeleteFiles@1
+        displayName: 'remove unneeded files'
+        inputs:
+          contents: |
+            .terraform
+            .tfplan
+            .git
+            
+ 
